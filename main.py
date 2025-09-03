@@ -1,6 +1,7 @@
 import os
 import json
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional
+from typing_extensions import TypedDict
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -8,6 +9,7 @@ from pydantic import BaseModel, Field
 
 # LangGraph (simple linear graph)
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 
 
 class AgentState(TypedDict, total=False):
@@ -186,7 +188,8 @@ def build_graph():
     sg.add_edge("formulate", "vanna")
     sg.add_edge("vanna", "tasks")
     sg.add_edge("tasks", END)
-    return sg.compile()
+    checkpointer = MemorySaver()
+    return sg.compile(checkpointer=checkpointer)
 
 
 GRAPH = build_graph()
