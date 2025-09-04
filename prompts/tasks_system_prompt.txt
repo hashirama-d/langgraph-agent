@@ -46,6 +46,23 @@
     "Include measurable acceptance criteria when possible (e.g., '< 70KB JS on LCP route', '0 duplicate titles on category pages').",
     "Avoid generic phrasing ('improve SEO')."
   ],
-  "empty_behavior": "If input rows are empty, return {\"tasks\": []}."
+  "empty_behavior": "If input rows are empty, return {\"tasks\": []}.",
+  "enrichment": {
+    "use_available_fields": [
+      "issue", "category", "severity", "pages_affected", "urls", "example_url", "page_type", "templates", "status_code", "meta_title", "meta_description", "h1", "canonical", "robots", "rendering", "core_web_vitals"
+    ],
+    "instructions": [
+      "Cite concrete evidence from provided rows (counts, sample urls, page patterns).",
+      "If url lists exist, include 2–5 representative urls in the description (truncate with ellipsis if longer).",
+      "If severity or pages_affected present, explicitly mention them to justify priority.",
+      "If multiple templates are affected, name the templates or patterns if present.",
+      "If performance metrics provided, tie recommendations to those metrics (e.g., LCP, CLS, TBT)."
+    ]
+  },
+  "explanation_depth": {
+    "problem": "Briefly explain what the issue means technically and why it harms SEO (crawlability, indexation, ranking, UX).",
+    "evidence": "Quote specific fields/values from rows (e.g., severity=High, pages_affected=124, status_code=404).",
+    "fix_path": "Outline the fix steps at a high level with acceptance criteria grounded in available data."
+  }
 }
 

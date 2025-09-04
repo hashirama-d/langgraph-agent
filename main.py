@@ -1,5 +1,8 @@
 import os
 import json
+import logging
+import time
+import uuid
 from typing import Any, Dict, List, Optional
 from typing_extensions import TypedDict
 
@@ -11,13 +14,31 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
+# LangSmith tracing (decorator)
+try:
+    from langsmith import traceable
+except Exception:
+    def traceable(*args, **kwargs):
+        def _wrap(func):
+            return func
+        return _wrap
+
+
+# Logging configuration
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL)
+logger = logging.getLogger("seo_tasks_agent")
+
 
 class AgentState(TypedDict, total=False):
+    request_id: str
     question: str
     vanna_id: str
     sql: str
     records: List[Dict[str, Any]]
     tasks: List[Dict[str, str]]
+    site: Optional[str]
+    top_n: Optional[int]
 
 
 class TasksRequest(BaseModel):
@@ -47,15 +68,9 @@ app = FastAPI(title="SEO Tasks Agent", version="0.1.0")
 
 
 def build_default_question(site: Optional[str], top_n: int) -> str:
-    base = f"Select the top {top_n} most important SEO issues"
-    if site:
-        base += f" for the site {site}"
-    # Guidance for Vanna to produce ranked issues
-    base += (
-        ". Return a table with columns like issue, category, severity, pages_affected, and recommendation. "
-        "Order by severity DESC, pages_affected DESC. Limit to " + str(top_n)
+    return (
+        "Select the top 10 most important SEO issues. For each issue, provide a list of urls, where issue happens. Ensure the issue is present in overview table before searching"
     )
-    return base
 
 
 def vanna_base_url() -> str:
@@ -92,16 +107,33 @@ def call_vanna_run_sql(vanna_id: str) -> Dict[str, Any]:
     return data
 
 
+@traceable(name="formulate")
 def node_formulate(state: AgentState) -> AgentState:
+    start_t = time.monotonic()
+    if not state.get("request_id"):
+        state["request_id"] = str(uuid.uuid4())
     if not state.get("question"):
         state["question"] = build_default_question(
             site=state.get("site"),  # type: ignore
             top_n=state.get("top_n", 10),  # type: ignore
         )
+    dur_ms = int((time.monotonic() - start_t) * 1000)
+    logger.info(
+        "formulate completed",
+        extra={
+            "request_id": state.get("request_id"),
+            "duration_ms": dur_ms,
+            "site": state.get("site"),
+            "top_n": state.get("top_n"),
+            "question_preview": str(state.get("question", ""))[:200],
+        },
+    )
     return state
 
 
+@traceable(name="vanna")
 def node_call_vanna(state: AgentState) -> AgentState:
+    start_t = time.monotonic()
     question = state["question"]
     gen = call_vanna_generate_sql(question)
     v_id = gen.get("id")
@@ -120,11 +152,24 @@ def node_call_vanna(state: AgentState) -> AgentState:
     except Exception:
         records = []
     state["records"] = records  # raw rows from Vanna (head up to 10)
+    dur_ms = int((time.monotonic() - start_t) * 1000)
+    logger.info(
+        "vanna completed",
+        extra={
+            "request_id": state.get("request_id"),
+            "duration_ms": dur_ms,
+            "vanna_id": v_id,
+            "sql_length": len(sql_text or ""),
+            "records_count": len(records),
+        },
+    )
     return state
 
 
+@traceable(name="tasks")
 def node_generate_tasks(state: AgentState) -> AgentState:
     # Use OpenAI to transform records into tasks in English
+    start_t = time.monotonic()
     from openai import OpenAI
 
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -175,6 +220,17 @@ def node_generate_tasks(state: AgentState) -> AgentState:
         state["tasks"] = norm_tasks
     except Exception:
         state["tasks"] = []
+    dur_ms = int((time.monotonic() - start_t) * 1000)
+    logger.info(
+        "tasks generation completed",
+        extra={
+            "request_id": state.get("request_id"),
+            "duration_ms": dur_ms,
+            "llm_model": model,
+            "rows_count": len(state.get("records", [])),
+            "tasks_count": len(state.get("tasks", [])),
+        },
+    )
     return state
 
 
@@ -197,7 +253,10 @@ GRAPH = build_graph()
 
 @app.post("/tasks", response_model=TasksResponse)
 def generate_tasks(req: TasksRequest) -> TasksResponse:
+    request_id = str(uuid.uuid4())
+    logger.info("/tasks invoked", extra={"request_id": request_id})
     initial_state: AgentState = {
+        "request_id": request_id,
         "question": req.question or "",
         "site": req.site,  # type: ignore
         "top_n": req.top_n,  # type: ignore
@@ -212,6 +271,13 @@ def generate_tasks(req: TasksRequest) -> TasksResponse:
             title = f"Investigate issue #{idx + 1}"
             description = json.dumps(row, ensure_ascii=False)
             tasks.append({"title": title, "description": description})
+    logger.info(
+        "/tasks completed",
+        extra={
+            "request_id": request_id,
+            "tasks_count": len(tasks),
+        },
+    )
     return TasksResponse(tasks=tasks)
 
 
