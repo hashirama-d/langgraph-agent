@@ -51,8 +51,8 @@ Thumbs.db
 .env
 .vanna_chromadb
 .vanna_chromadb/*
-venv
-venv/*
+.venv
+.venv/*
 # I specifically do not ignore this file because we need to transfer to different bigquery anyways.
 # In prod version it should be ignored.
 # valid-expanse-410613-1130cd098ed8.json

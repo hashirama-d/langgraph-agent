@@ -8,8 +8,6 @@ from typing_extensions import TypedDict
 
 import requests
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
-
 try:
     from langsmith import traceable
 except Exception:
@@ -32,16 +30,14 @@ class AgentState(TypedDict, total=False):
     tasks: List[Dict[str, str]]
     site: Optional[str]
     top_n: Optional[int]
-
-
-def build_default_question(site: Optional[str], top_n: int) -> str:
-    return (
-        "Select the top 10 most important SEO issues. For each issue, provide a list of urls, where issue happens. Ensure the issue is present in overview table before searching"
-    )
+    selection_id: Optional[str]
 
 
 def vanna_base_url() -> str:
-    return os.getenv("VANNA_BASE_URL", "http://localhost:8000")
+    url = os.getenv("VANNA_BASE_URL")
+    if not url:
+        raise RuntimeError("VANNA_BASE_URL is not set")
+    return url
 
 
 def call_vanna_generate_sql(question: str) -> Dict[str, Any]:
@@ -68,30 +64,6 @@ def call_vanna_run_sql(vanna_id: str) -> Dict[str, Any]:
     return data
 
 
-@traceable(name="formulate")
-def node_formulate(state: AgentState) -> AgentState:
-    start_t = time.monotonic()
-    if not state.get("request_id"):
-        state["request_id"] = str(uuid.uuid4())
-    if not state.get("question"):
-        state["question"] = build_default_question(
-            site=state.get("site"),  # type: ignore
-            top_n=state.get("top_n", 10),  # type: ignore
-        )
-    dur_ms = int((time.monotonic() - start_t) * 1000)
-    logger.info(
-        "formulate completed",
-        extra={
-            "request_id": state.get("request_id"),
-            "duration_ms": dur_ms,
-            "site": state.get("site"),
-            "top_n": state.get("top_n"),
-            "question_preview": str(state.get("question", ""))[:200],
-        },
-    )
-    return state
-
-
 @traceable(name="vanna")
 def node_call_vanna(state: AgentState) -> AgentState:
     start_t = time.monotonic()
@@ -113,6 +85,29 @@ def node_call_vanna(state: AgentState) -> AgentState:
     except Exception:
         records = []
     state["records"] = records
+    # Persist selection to Supabase if available (REST)
+    try:
+        from persistence import save_selection
+
+        sel_id = save_selection(
+            {
+                "source_type": "vanna_sql",
+                "input_params": {
+                    "question": state.get("question"),
+                    "vanna_id": v_id,
+                    "sql": sql_text,
+                    "site": state.get("site"),
+                    "top_n": state.get("top_n"),
+                },
+                "items": records,
+                "notes": "auto-ingested",
+                "version": 1,
+            }
+        )
+        if sel_id:
+            state["selection_id"] = sel_id
+    except Exception as e:
+        logger.warning("Supabase save_selection failed", extra={"error": str(e)})
     dur_ms = int((time.monotonic() - start_t) * 1000)
     logger.info(
         "vanna completed",
@@ -145,10 +140,39 @@ def node_generate_tasks(state: AgentState) -> AgentState:
             "{\n  \"role\": \"system\",\n  \"goal\": \"Convert structured rows of SEO issues into tasks.\",\n  \"output\": {\n    \"format\": \"json_object\",\n    \"schema\": {\"type\": \"object\", \"properties\": {\"tasks\": {\"type\": \"array\"}}, \"required\": [\"tasks\"]}\n  }\n}"
         )
 
+    # RAG: pull SEO context from Pinecone (rag_seo)
+    seo_context = ""
+    hits_count = 0
+    try:
+        from retrievers import get_retriever
+
+        retr = get_retriever("seo")
+        rows = state.get("records", [])
+        issue_hints = []
+        for row in rows[:10]:
+            if isinstance(row, dict):
+                for key in ("issue", "category", "status_code", "robots", "canonical"):
+                    val = row.get(key)
+                    if val:
+                        issue_hints.append(str(val))
+        query = ("; ".join(issue_hints) or state.get("question", "SEO issues"))[:512]
+        hits = retr.search(collection="rag_seo", query=query, k=6)
+        hits_count = len(hits)
+        seo_context = "\n\n---\n\n".join([h.get("text", "") for h in hits if h.get("text")])
+        # DEBUG
+        try:
+            preview = ((hits[0].get("text", "")) if hits else "")[:160].replace("\n", " ")
+            logger.debug("rag_seo hits", extra={"count": hits_count, "preview": preview})
+        except Exception:
+            pass
+    except Exception as e:
+        logger.debug("rag_seo retrieval failed", extra={"error": str(e)})
+
     content = {
         "question": state.get("question", ""),
         "sql": state.get("sql", ""),
         "rows": state.get("records", []),
+        "seo_context": seo_context,
     }
 
     completion = client.chat.completions.create(
@@ -175,6 +199,13 @@ def node_generate_tasks(state: AgentState) -> AgentState:
             if title:
                 norm_tasks.append({"title": title, "description": description})
         state["tasks"] = norm_tasks
+        # Persist tasks to Supabase if available
+        try:
+            from persistence import save_tasks
+
+            save_tasks(selection_id=state.get("selection_id"), tasks=norm_tasks, raw_output=obj)
+        except Exception as e:
+            logger.warning("Supabase save_tasks failed", extra={"error": str(e)})
     except Exception:
         state["tasks"] = []
     dur_ms = int((time.monotonic() - start_t) * 1000)
@@ -186,25 +217,110 @@ def node_generate_tasks(state: AgentState) -> AgentState:
             "llm_model": model,
             "rows_count": len(state.get("records", [])),
             "tasks_count": len(state.get("tasks", [])),
+            "rag_seo_hits": hits_count,
         },
     )
     return state
 
 
+@traceable(name="tasks")
+def node_generate_tasks(state: AgentState) -> AgentState:
+    start_t = time.monotonic()
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    prompt_txt_path = os.path.join(base_dir, "prompts", "tasks_system_prompt.txt")
+    try:
+        with open(prompt_txt_path, "r", encoding="utf-8") as f:
+            instructions = f.read()
+    except Exception:
+        instructions = (
+            "{\n  \"role\": \"system\",\n  \"goal\": \"Convert structured rows of SEO issues into tasks.\",\n  \"output\": {\n    \"format\": \"json_object\",\n    \"schema\": {\"type\": \"object\", \"properties\": {\"tasks\": {\"type\": \"array\"}}, \"required\": [\"tasks\"]}\n  }\n}"
+        )
+
+    # RAG: pull SEO context from Pinecone (rag_seo)
+    seo_context = ""
+    hits_count = 0
+    try:
+        from retrievers import get_retriever
+
+        retr = get_retriever("seo")
+        rows = state.get("records", [])
+        issue_hints = []
+        for row in rows[:10]:
+            if isinstance(row, dict):
+                for key in ("issue", "category", "status_code", "robots", "canonical"):
+                    val = row.get(key)
+                    if val:
+                        issue_hints.append(str(val))
+        query = ("; ".join(issue_hints) or state.get("question", "SEO issues"))[:512]
+        hits = retr.search(collection="rag_seo", query=query, k=6)
+        hits_count = len(hits)
+        seo_context = "\n\n---\n\n".join([h.get("text", "") for h in hits if h.get("text")])
+        # DEBUG
+        try:
+            preview = ((hits[0].get("text", "")) if hits else "")[:160].replace("\n", " ")
+            logger.debug("rag_seo hits", extra={"count": hits_count, "preview": preview})
+        except Exception:
+            pass
+    except Exception as e:
+        logger.debug("rag_seo retrieval failed", extra={"error": str(e)})
+
+    content = {
+        "question": state.get("question", ""),
+        "sql": state.get("sql", ""),
+        "rows": state.get("records", []),
+        "seo_context": seo_context,
+    }
+
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": instructions},
+            {
+                "role": "user",
+                "content": "Transform these rows into tasks (JSON only):\n" + json.dumps(content, ensure_ascii=False),
+            },
+        ],
+        temperature=1,
+        response_format={"type": "json_object"},
+    )
+
+    text = completion.choices[0].message.content or "{}"
+    try:
+        obj = json.loads(text)
+        tasks = obj.get("tasks", [])
+        norm_tasks: List[Dict[str, str]] = []
+        for t in tasks:
+            title = str(t.get("title", "")).strip()
+            description = str(t.get("description", "")).strip()
+            if title:
+                norm_tasks.append({"title": title, "description": description})
+        state["tasks"] = norm_tasks
+        # Persist tasks to Supabase if available
+        try:
+            from persistence import save_tasks
+
+            save_tasks(selection_id=state.get("selection_id"), tasks=norm_tasks, raw_output=obj)
+        except Exception as e:
+            logger.warning("Supabase save_tasks failed", extra={"error": str(e)})
+    except Exception:
+        state["tasks"] = []
+    return state
+
+
 def build_graph():
     sg = StateGraph(AgentState)
-    sg.add_node("formulate", node_formulate)
     sg.add_node("vanna", node_call_vanna)
     sg.add_node("tasks", node_generate_tasks)
 
-    sg.set_entry_point("formulate")
-    sg.add_edge("formulate", "vanna")
+    sg.set_entry_point("vanna")
     sg.add_edge("vanna", "tasks")
     sg.add_edge("tasks", END)
-    return sg.compile(checkpointer=CHECKPOINTER)
-
-
-CHECKPOINTER = MemorySaver()
+    return sg.compile()
 
 GRAPH = build_graph()
 

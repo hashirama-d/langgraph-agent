@@ -1,0 +1,1 @@
+Common SEO issues include: 4xx/5xx errors, missing canonicals, robots.txt disallow, duplicate titles, rendering problems, poor LCP/CLS, blocked resources. When generating tasks, cite evidence and acceptance criteria.
